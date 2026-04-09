@@ -1,3 +1,50 @@
+# Project 4 Code Pack
+
+Below is a minimal full implementation based directly on the assignment.
+
+---
+
+## 1) `platformio.ini`
+
+```ini
+[env:m5stack-core2]
+platform = espressif32
+board = m5stack-core2
+framework = arduino
+monitor_speed = 115200
+
+lib_deps =
+  m5stack/M5Core2 @ ^0.1.9
+  bblanchon/ArduinoJson @ ^7.0.4
+  adafruit/Adafruit SHT4x Library @ ^1.0.5
+  adafruit/Adafruit VCNL4040 @ ^1.0.3
+```
+
+---
+
+## 2) `src/secrets.h`
+
+```cpp
+#pragma once
+
+// ---------- WIFI ----------
+static const char* WIFI_SSID = "YOUR_WIFI_NAME";
+static const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+
+// ---------- CLOUD RUN URLS ----------
+static const char* UPLOAD_URL = "https://YOUR-UPLOAD-SERVICE.run.app/upload";
+static const char* AVERAGE_URL = "https://YOUR-AVERAGE-SERVICE.run.app/average";
+
+// ---------- DEVICE USER ----------
+// Change this to a different hardcoded value on the second M5.
+static const char* USER_ID = "DanGrissom";   // other device: "JonDoe"
+```
+
+---
+
+## 3) `src/main.cpp`
+
+```cpp
 #include <M5Core2.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -424,3 +471,313 @@ void handleButtons() {
     }
   }
 }
+```
+
+---
+
+## 4) Cloud Function 1 — Upload Service
+
+### `upload_function/requirements.txt`
+
+```txt
+flask==3.0.3
+google-cloud-firestore==2.16.0
+gunicorn==22.0.0
+```
+
+### `upload_function/main.py`
+
+```python
+from flask import Flask, request, jsonify
+from google.cloud import firestore
+from datetime import datetime, timezone
+
+app = Flask(__name__)
+db = firestore.Client()
+COLLECTION_NAME = "sensorUploads"
+
+REQUIRED_FIELDS = [
+    "userId",
+    "timestampEpoch",
+    "temp",
+    "rHum",
+    "prox",
+    "lux",
+    "ax",
+    "ay",
+    "az",
+]
+
+@app.get("/")
+def home():
+    return jsonify({"message": "Upload function alive"}), 200
+
+@app.post("/upload")
+def upload_sensor_data():
+    data = request.get_json(silent=True) or {}
+
+    missing = [field for field in REQUIRED_FIELDS if field not in data]
+    if missing:
+        return jsonify({
+            "success": False,
+            "message": f"Missing fields: {', '.join(missing)}"
+        }), 400
+
+    try:
+        timestamp_epoch = int(data["timestampEpoch"])
+        utc_dt = datetime.fromtimestamp(timestamp_epoch, tz=timezone.utc)
+
+        doc = {
+            "userId": str(data["userId"]),
+            "timestampEpoch": timestamp_epoch,
+            "timestampIso": utc_dt.isoformat(),
+            "temp": float(data["temp"]),
+            "rHum": float(data["rHum"]),
+            "prox": float(data["prox"]),
+            "lux": float(data["lux"]),
+            "ax": float(data["ax"]),
+            "ay": float(data["ay"]),
+            "az": float(data["az"]),
+            "createdAt": firestore.SERVER_TIMESTAMP,
+        }
+
+        db.collection(COLLECTION_NAME).add(doc)
+
+        return jsonify({
+            "success": True,
+            "message": "Upload stored"
+        }), 200
+
+    except Exception as exc:
+        return jsonify({
+            "success": False,
+            "message": str(exc)
+        }), 500
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
+```
+
+### `upload_function/Dockerfile`
+
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD exec gunicorn --bind :8080 --workers 1 --threads 8 --timeout 0 main:app
+```
+
+---
+
+## 5) Cloud Function 2 — Averaging Service
+
+### `average_function/requirements.txt`
+
+```txt
+flask==3.0.3
+google-cloud-firestore==2.16.0
+gunicorn==22.0.0
+```
+
+### `average_function/main.py`
+
+```python
+from flask import Flask, request, jsonify
+from google.cloud import firestore
+from datetime import datetime, timezone
+
+app = Flask(__name__)
+db = firestore.Client()
+COLLECTION_NAME = "sensorUploads"
+ALLOWED_TYPES = {"temp", "rHum", "prox", "lux", "ax", "ay", "az"}
+UNIT_MAP = {
+    "temp": "F",
+    "rHum": "%",
+    "prox": "count",
+    "lux": "lux",
+    "ax": "g",
+    "ay": "g",
+    "az": "g",
+}
+
+
+def format_epoch(epoch: int) -> str:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+@app.get("/")
+def home():
+    return jsonify({"message": "Average function alive"}), 200
+
+
+@app.get("/average")
+def average_data():
+    user_id = request.args.get("userId", "")
+    time_duration = request.args.get("timeDuration", "")
+    data_type = request.args.get("dataType", "")
+
+    if not user_id or not time_duration or not data_type:
+        return jsonify({
+            "success": False,
+            "message": "Missing userId, timeDuration, or dataType"
+        }), 400
+
+    if data_type not in ALLOWED_TYPES:
+        return jsonify({
+            "success": False,
+            "message": f"Unsupported dataType: {data_type}"
+        }), 400
+
+    try:
+        time_duration = int(time_duration)
+    except ValueError:
+        return jsonify({
+            "success": False,
+            "message": "timeDuration must be an integer"
+        }), 400
+
+    try:
+        now_epoch = int(datetime.now(timezone.utc).timestamp())
+        min_epoch = now_epoch - time_duration
+
+        query = db.collection(COLLECTION_NAME).where("timestampEpoch", ">=", min_epoch)
+        if user_id != "All":
+            query = query.where("userId", "==", user_id)
+
+        docs = list(query.stream())
+
+        rows = []
+        for doc in docs:
+            row = doc.to_dict()
+            if data_type in row and isinstance(row[data_type], (int, float)):
+                rows.append(row)
+
+        if not rows:
+            return jsonify({
+                "success": False,
+                "message": "No matching data found",
+                "dataType": data_type,
+                "averageValue": 0,
+                "units": UNIT_MAP.get(data_type, ""),
+                "minTimestampText": "N/A",
+                "maxTimestampText": "N/A",
+                "elapsedSeconds": 0,
+                "dataPointCount": 0,
+                "dataRate": 0.0,
+            }), 200
+
+        values = [float(row[data_type]) for row in rows]
+        timestamps = [int(row["timestampEpoch"]) for row in rows]
+
+        average_value = sum(values) / len(values)
+        min_timestamp = min(timestamps)
+        max_timestamp = max(timestamps)
+        elapsed_seconds = max(0, max_timestamp - min_timestamp)
+        data_point_count = len(values)
+        data_rate = (data_point_count / elapsed_seconds) if elapsed_seconds > 0 else float(data_point_count)
+
+        return jsonify({
+            "success": True,
+            "message": "Average computed",
+            "dataType": data_type,
+            "averageValue": round(average_value, 4),
+            "units": UNIT_MAP.get(data_type, ""),
+            "minTimestamp": min_timestamp,
+            "maxTimestamp": max_timestamp,
+            "minTimestampText": format_epoch(min_timestamp),
+            "maxTimestampText": format_epoch(max_timestamp),
+            "elapsedSeconds": elapsed_seconds,
+            "dataPointCount": data_point_count,
+            "dataRate": round(data_rate, 4),
+        }), 200
+
+    except Exception as exc:
+        return jsonify({
+            "success": False,
+            "message": str(exc)
+        }), 500
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
+```
+
+### `average_function/Dockerfile`
+
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD exec gunicorn --bind :8080 --workers 1 --threads 8 --timeout 0 main:app
+```
+
+---
+
+## 6) Firestore document shape
+
+Each upload inserts one flat document into collection `sensorUploads`:
+
+```json
+{
+  "userId": "DanGrissom",
+  "timestampEpoch": 1744651232,
+  "timestampIso": "2025-04-14T20:20:32+00:00",
+  "temp": 72.1,
+  "rHum": 41.3,
+  "prox": 8,
+  "lux": 215.6,
+  "ax": 0.03,
+  "ay": -0.01,
+  "az": 0.98,
+  "createdAt": "server timestamp"
+}
+```
+
+---
+
+## 7) What to change before running
+
+1. Put your Wi-Fi name/password into `secrets.h`
+2. Deploy both cloud services and paste their URLs into `secrets.h`
+3. Change `USER_ID` on the second M5 to the second hardcoded user
+4. Confirm your sensor libraries match your exact hardware wiring
+5. In Google Cloud, enable Firestore and authenticate Cloud Run with a service account that can read/write Firestore
+
+---
+
+## 8) Deploy commands (example)
+
+### Upload function
+
+```bash
+gcloud run deploy project4-upload \
+  --source . \
+  --region us-west1 \
+  --allow-unauthenticated
+```
+
+### Average function
+
+```bash
+gcloud run deploy project4-average \
+  --source . \
+  --region us-west1 \
+  --allow-unauthenticated
+```
+
+---
+
+## 9) Notes
+
+- This implementation is intentionally minimal and rubric-focused.
+- Screen 1 updates every 5 seconds and uploads every 5 seconds.
+- Screen 2 contains userId, timeDuration, dataType, and Get Average.
+- Screen 3 displays the returned average data and required stats.
+- The assignment allows limiting average selections to 3 data types, so this uses `temp`, `rHum`, and `ax` on the M5 UI.
+- All live values still appear on Screen 1.
+```
+
